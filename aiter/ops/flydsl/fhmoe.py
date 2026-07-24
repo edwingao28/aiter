@@ -39,6 +39,7 @@ def compile_flydsl_fhmoe_stage1(
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
     a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int = -1,
 ):
@@ -71,6 +72,7 @@ def compile_flydsl_fhmoe_stage1(
         inter_dim_pad=inter_dim_pad,
         enable_bias=enable_bias,
         a_scale_one=a_scale_one,
+        xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         shared_expert_id=shared_expert_id,
     )
@@ -98,6 +100,7 @@ def compile_flydsl_fhmoe_stage2(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
+    xcd_swizzle: int = 0,
     shared_expert_id: int = -1,
 ):
     """Compile the heterogeneous stage2 kernel."""
@@ -127,14 +130,9 @@ def compile_flydsl_fhmoe_stage2(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         enable_bias=enable_bias,
+        xcd_swizzle=xcd_swizzle,
         shared_expert_id=shared_expert_id,
     )
-
-
-def _compile_fhmoe_xcd0(compiler, *, xcd_swizzle: int, **kwargs):
-    if xcd_swizzle != 0:
-        raise ValueError("FHMoE kernels do not support XCD swizzling")
-    return compiler(**kwargs)
 
 
 def _s1_args_fhmoe(
@@ -268,6 +266,7 @@ def flydsl_fhmoe_stage1(
     bias: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
     swiglu_limit: Optional[float] = None,
     k_wave: int = 1,
     shared_w1: torch.Tensor,
@@ -276,11 +275,8 @@ def flydsl_fhmoe_stage1(
 ):
     """Run stage1 with MXFP4 routed experts and one FP8 shared expert."""
     compile_kernel = functools.partial(
-        _compile_fhmoe_xcd0,
-        functools.partial(
-            compile_flydsl_fhmoe_stage1,
-            shared_expert_id=shared_expert_id,
-        ),
+        compile_flydsl_fhmoe_stage1,
+        shared_expert_id=shared_expert_id,
     )
     build_mx_args = functools.partial(
         _s1_args_fhmoe,
@@ -316,7 +312,7 @@ def flydsl_fhmoe_stage1(
         bias=bias,
         topk_ids=topk_ids,
         a_scale_one=a_scale_one,
-        xcd_swizzle=0,
+        xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         _compile_kernel=compile_kernel,
@@ -351,6 +347,7 @@ def flydsl_fhmoe_stage2(
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
+    xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
     return_per_slot: bool = False,
     expert_mask: Optional[torch.Tensor] = None,
@@ -361,11 +358,8 @@ def flydsl_fhmoe_stage2(
 ) -> torch.Tensor:
     """Run stage2 with MXFP4 routed experts and one FP8 shared expert."""
     compile_kernel = functools.partial(
-        _compile_fhmoe_xcd0,
-        functools.partial(
-            compile_flydsl_fhmoe_stage2,
-            shared_expert_id=shared_expert_id,
-        ),
+        compile_flydsl_fhmoe_stage2,
+        shared_expert_id=shared_expert_id,
     )
     build_mx_args = functools.partial(
         _s2_args_fhmoe,
@@ -398,7 +392,7 @@ def flydsl_fhmoe_stage2(
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
-        xcd_swizzle=0,
+        xcd_swizzle=xcd_swizzle,
         bias=bias,
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
