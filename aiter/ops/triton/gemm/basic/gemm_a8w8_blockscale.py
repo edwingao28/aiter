@@ -6,6 +6,7 @@ import os
 import torch
 import triton
 import math
+from packaging.version import Version
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
     _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
@@ -20,6 +21,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
+_TRITON_GE_37 = Version(triton.__version__) >= Version("3.7.0")
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
@@ -299,6 +301,16 @@ def gemm_a8w8_blockscale_preshuffle(
 
     if config is None:
         config, _ = _get_config(M, N, K, True, backend=backend)
+
+    # Triton 3.6 fails TritonAMDGPUConvertToBufferOps for gfx950 preshuffle
+    # configs with three pipeline stages. Keep the tuned tile and split-K.
+    if (
+        backend == "triton"
+        and get_arch() == "gfx950"
+        and not _TRITON_GE_37
+        and config.get("num_stages", 1) > 2
+    ):
+        config["num_stages"] = 2
 
     kernel_type_from_config = config.pop("kernel_type", None)
     if kernel_type_from_config is not None:
