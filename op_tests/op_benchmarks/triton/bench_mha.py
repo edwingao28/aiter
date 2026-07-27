@@ -688,22 +688,22 @@ def run_benchmark(run: BenchRun):
                     * 2.0
                 )
 
-            fn_kwargs = dict(
-                sm_scale=sm_scale,
-                causal=causal,
-                dropout=dropout,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-                sink=sink,
-                window_size=window_size,
-                has_pe=has_pe,
-                has_sink=run.sink,
-                backend=run.backend,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-            )
+            fn_kwargs = {
+                "sm_scale": sm_scale,
+                "causal": causal,
+                "dropout": dropout,
+                "return_lse": return_lse,
+                "return_attn_probs": return_attn_probs,
+                "sink": sink,
+                "window_size": window_size,
+                "has_pe": has_pe,
+                "has_sink": run.sink,
+                "backend": run.backend,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+            }
             fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
             if fn is None:
                 return 0
@@ -718,18 +718,18 @@ def run_benchmark(run: BenchRun):
                 * (D_HEAD + D_HEAD_V)
             )
 
-            fn_kwargs = dict(
-                sm_scale=sm_scale,
-                causal=causal,
-                dropout=dropout,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-                sink=sink,
-                window_size=window_size,
-                has_pe=has_pe,
-                has_sink=run.sink,
-                backend=run.backend,
-            )
+            fn_kwargs = {
+                "sm_scale": sm_scale,
+                "causal": causal,
+                "dropout": dropout,
+                "return_lse": return_lse,
+                "return_attn_probs": return_attn_probs,
+                "sink": sink,
+                "window_size": window_size,
+                "has_pe": has_pe,
+                "has_sink": run.sink,
+                "backend": run.backend,
+            }
             fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
             if fn is None:
                 return 0
