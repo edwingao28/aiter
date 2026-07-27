@@ -1,33 +1,34 @@
-import torch
-import warnings
 import argparse
-import itertools
 import dataclasses
+import itertools
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+
+import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-    mha_set_use_fused_bwd_kernel,
     mha_set_impl,
-    gluon_forward_unsupported_reason,
+    mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
-    get_caller_name_no_ext,
 )
 
 
@@ -583,21 +584,10 @@ def run_benchmark(run: BenchRun):
             if is_bwd or is_decode:
                 warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
                 return 0
-            if dtype == "fp8":
-                warnings.warn("Skipping: Gluon backend does not support fp8.")
-                return 0
             if has_pe or run.sink or has_sliding_window:
                 warnings.warn(
                     "Skipping: Gluon backend does not support PE, sink, or sliding window."
                 )
-                return 0
-            # Catch shape configs the kernel can't compile (e.g. a padded head_dim
-            # with a non-16-element-aligned KV stride) before launching
-            gluon_reason = gluon_forward_unsupported_reason(
-                head_dim=D_HEAD, num_k_heads=HK
-            )
-            if gluon_reason:
-                warnings.warn(f"Skipping: {gluon_reason}")
                 return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype)

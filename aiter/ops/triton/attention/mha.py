@@ -1,24 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
 from packaging.version import Version
 
-import aiter.ops.triton.utils.types as types
-from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
-from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
-
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
+from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
+from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
+from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -34,6 +34,9 @@ _LOGGER = AiterTritonLogger()
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
 _TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
 
+global _USE_FUSED_BWD_KERNEL
+_USE_FUSED_BWD_KERNEL = False
+
 
 def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
@@ -46,10 +49,39 @@ def is_gluon_available() -> bool:
         return False
 
 
+def mha_set_use_fused_bwd_kernel(value: bool):
+    """
+    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
+    Fused backward is faster but doesn't support positional encoding.
+    """
+    global _USE_FUSED_BWD_KERNEL
+    _USE_FUSED_BWD_KERNEL = value
+
+
+_MHA_IMPL: Literal["default", "dao_ai"] = "default"
+
+
+def mha_set_impl(impl: Literal["default", "dao_ai"]):
+    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
+    global _MHA_IMPL
+    _MHA_IMPL = impl
+
+
+_USE_INT64_STRIDES = True
+
+
+def mha_set_use_int64_strides(value: bool):
+    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
+    global _USE_INT64_STRIDES
+    _USE_INT64_STRIDES = value
+
+
+def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
+    return max(int(window_size[0]), 0)
+
+
 def gluon_forward_unsupported_reason(
     *,
-    head_dim=None,
-    num_k_heads=None,
     dropout_p: float = 0.0,
     window_size=(-1, -1),
     bias=None,
@@ -57,13 +89,12 @@ def gluon_forward_unsupported_reason(
     sink=None,
     return_lse: bool = False,
     return_attn_probs: bool = False,
-    is_fp8: bool = False,
     has_positional_encoding: bool = False,
     block_table=None,
 ):
     """Reason (str) why the Gluon forward backend can't serve this config, else None.
 
-    Pass the feature flags and, optionally, ``head_dim`` / ``num_k_heads`` for the shape checks.
+    Pass the feature flags for the support checks.
     """
     if not is_gluon_available():
         return (
@@ -88,20 +119,6 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support positional encoding"
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
-    if head_dim is not None:
-        # The kernel rounds head_dim up to a multiple of 8 (see
-        # _gluon_flash_attn_forward), then pads that up to a power of 2 (>=16)
-        # for the MFMA tile. Known-bug: a padded head whose (rounded) per-head
-        # size is not a multiple of 16 elements fails to legalize the masked
-        # async global->LDS copy during compilation on gfx950.
-        min_pad = 64 if is_fp8 else 16
-        head_dim = head_dim + (-head_dim % 8)
-        padded_head = head_dim != max(triton.next_power_of_2(head_dim), min_pad)
-        if padded_head and head_dim % 16 != 0:
-            return (
-                "Gluon MHA backend: padded head_dim that is not 16-element-aligned "
-                f"(head_dim={head_dim}) is currently broken"
-            )
     return None
 
 
@@ -170,8 +187,7 @@ def _gluon_flash_attn_forward(
         )
         # The scaled f8f6f4 MFMA is 32x32x64 (K=64), so the P@V contraction
         # (BLOCK_N) must be a multiple of 64.
-        if BLOCK_N < 64:
-            BLOCK_N = 64
+        BLOCK_N = max(BLOCK_N, 64)
 
     if varlen:
         _, num_q_heads, head_dim = q.shape
@@ -239,10 +255,10 @@ def _gluon_flash_attn_forward(
         cu_seqlens_k,
         seqlen_q,
         seqlen_k,
-        *q_strides,  #
-        *k_strides,  #
-        *v_strides,  #
-        *o_strides,  #
+        *q_strides,
+        *k_strides,
+        *v_strides,
+        *o_strides,
         descale_q.stride(0) if descale_q is not None else 0,
         descale_k.stride(0) if descale_k is not None else 0,
         descale_v.stride(0) if descale_v is not None else 0,
@@ -273,41 +289,6 @@ def _gluon_flash_attn_forward(
     return o
 
 
-global _USE_FUSED_BWD_KERNEL
-_USE_FUSED_BWD_KERNEL = False
-
-
-def mha_set_use_fused_bwd_kernel(value: bool):
-    """
-    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
-    Fused backward is faster but doesn't support positional encoding.
-    """
-    global _USE_FUSED_BWD_KERNEL
-    _USE_FUSED_BWD_KERNEL = value
-
-
-_MHA_IMPL: Literal["default", "dao_ai"] = "default"
-
-
-def mha_set_impl(impl: Literal["default", "dao_ai"]):
-    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
-    global _MHA_IMPL
-    _MHA_IMPL = impl
-
-
-_USE_INT64_STRIDES = True
-
-
-def mha_set_use_int64_strides(value: bool):
-    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
-    global _USE_INT64_STRIDES
-    _USE_INT64_STRIDES = value
-
-
-def _get_sliding_window_size(window_size: Tuple[int, int]) -> int:
-    return int(window_size[0]) if int(window_size[0]) >= 0 else 0
-
-
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -317,26 +298,26 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     return_lse: bool,  # Not used
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    sink: Optional[torch.Tensor] = None,
-    config: Optional[dict[str, any]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
     if _MHA_IMPL != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
-    sliding_window = window_size_left if window_size_left >= 0 else 0
+    sliding_window = max(window_size_left, 0)
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
     max_seqlen_q = int(max_seqlen_q)
@@ -502,7 +483,7 @@ def _flash_attn_forward(
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
@@ -782,8 +763,8 @@ def flash_attn_func(
     q_descale=None,
     k_descale=None,
     v_descale=None,
-    config: Optional[dict[str, any]] = None,
-    backend: Optional[str] = "triton",
+    config: dict[str, any] | None = None,
+    backend: str | None = "triton",
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -849,8 +830,6 @@ def flash_attn_func(
 
     if backend == "gluon":
         reason = gluon_forward_unsupported_reason(
-            head_dim=q.shape[-1],
-            num_k_heads=k.shape[-2],
             dropout_p=dropout_p,
             window_size=window_size,
             bias=bias,
@@ -858,7 +837,6 @@ def flash_attn_func(
             sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-            is_fp8=types._is_fp8(q),
             has_positional_encoding=q.shape[-1] != v.shape[-1],
         )
         assert reason is None, reason
@@ -1127,8 +1105,8 @@ def flash_attn_varlen_func(
     q_descale=None,
     k_descale=None,
     v_descale=None,
-    config: Optional[dict[str, any]] = None,
-    backend: Optional[str] = "triton",
+    config: dict[str, any] | None = None,
+    backend: str | None = "triton",
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1200,8 +1178,6 @@ def flash_attn_varlen_func(
 
     if backend == "gluon":
         reason = gluon_forward_unsupported_reason(
-            head_dim=q.shape[-1],
-            num_k_heads=k.shape[-2],
             dropout_p=dropout_p,
             window_size=window_size,
             bias=bias,
@@ -1209,7 +1185,6 @@ def flash_attn_varlen_func(
             sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-            is_fp8=types._is_fp8(q),
             has_positional_encoding=q.shape[-1] != v.shape[-1],
             block_table=block_table,
         )
@@ -1259,20 +1234,20 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[Union[torch.Tensor, int]] = None,
-    softmax_scale: Optional[float] = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | int | None = None,
+    softmax_scale: float | None = None,
     causal: bool = True,
     window_size: tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
     num_splits: int = 0,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
     rotary_interleaved: bool = True,
     return_softmax_lse: bool = False,
 ):

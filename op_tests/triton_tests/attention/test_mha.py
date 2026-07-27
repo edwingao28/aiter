@@ -1,22 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 import logging
+
+import pytest
+import torch
+
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
+    gluon_forward_unsupported_reason,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
-    gluon_forward_unsupported_reason,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
 )
 from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
 
@@ -25,17 +27,13 @@ logger = logging.getLogger(__name__)
 DEBUG_MODE = False
 
 
-def _skip_if_gluon_unsupported(
-    backend: str, head_sz: int, num_k_heads: int, **feature_flags
-):
+def _skip_if_gluon_unsupported(backend: str, **feature_flags):
     """
     Skip forward tests the Gluon backend can't run.
     """
     if backend != "gluon":
         return
-    reason = gluon_forward_unsupported_reason(
-        head_dim=head_sz, num_k_heads=num_k_heads, **feature_flags
-    )
+    reason = gluon_forward_unsupported_reason(**feature_flags)
     if reason:
         pytest.skip(reason)
 
@@ -54,7 +52,12 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    _skip_if_gluon_unsupported(backend, HEAD_SZ, NUM_K_HEADS)
+    _skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -148,7 +151,7 @@ def test_mha(
     )
 
 
-def _fp8_assert_close(actual, expected, atol=2.0, cos_sim_threshold=0.94):
+def _fp8_assert_close(actual, expected, atol=1.0, cos_sim_threshold=0.94):
     """Loose fp8 comparison: bounded max-abs error plus cosine similarity.
 
     fp8 attention has larger elementwise error than bf16, so we check direction
@@ -201,7 +204,7 @@ def test_mha_fp8_gluon(
     """FP8 forward on the Gluon backend: pre-quantize q/k/v to fp8 e4m3 with
     per-(batch, head) descales, run the Gluon kernel (fp32 output), and compare
     against the high-precision torch reference with a loose fp8 tolerance."""
-    _skip_if_gluon_unsupported("gluon", HEAD_SZ, NUM_K_HEADS, is_fp8=True)
+    _skip_if_gluon_unsupported("gluon")
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -283,8 +286,6 @@ def test_mha_int64_strides(
     test_backward = test_backward and not is_gluon
     _skip_if_gluon_unsupported(
         backend,
-        HEAD_SZ,
-        NUM_K_HEADS,
         dropout_p=DROPOUT,
         return_lse=return_lse,
     )
@@ -378,7 +379,12 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    _skip_if_gluon_unsupported(backend, HEAD_SZ, NUM_K_HEADS)
+    _skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
