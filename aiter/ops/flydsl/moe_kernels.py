@@ -1412,7 +1412,7 @@ def flydsl_moe_stage1(
                 else torch.empty(0, device=dev)
             ),
             swiglu_limit=_swiglu_limit_val,
-            include_stage2_out=(b_dtype != "fp4"),
+            include_stage2_out=False,
         )
     else:
         args = _s1_args_std(

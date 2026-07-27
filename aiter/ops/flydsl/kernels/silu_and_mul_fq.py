@@ -169,8 +169,9 @@ def build_silu_and_mul_fq_module(
         scale_rsrc = _ptr_buffer_resource(out_scale_sorted)
         tid_rsrc = _ptr_buffer_resource(sorted_ids)
         nv_rsrc = _ptr_buffer_resource(num_valid_ids)
-        topk_rsrc = _ptr_buffer_resource(topk_ids)
-        bias_rsrc = _ptr_buffer_resource(bias)
+        if const_expr(enable_bias):
+            topk_rsrc = _ptr_buffer_resource(topk_ids)
+            bias_rsrc = _ptr_buffer_resource(bias)
 
         def _load_bias_scalar(offset):
             return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
@@ -212,10 +213,11 @@ def build_silu_and_mul_fq_module(
                 _if_valid = scf.IfOp(is_valid, has_else=True)
                 with ir.InsertionPoint(_if_valid.then_block):
                     in_row = token_id * topk_i32 + slot_id
-                    expert_id = buffer_ops.buffer_load(
-                        topk_rsrc, in_row, vec_width=1, dtype=i32
-                    )
-                    bias_row = expert_id * inter_dim2_i32
+                    if const_expr(enable_bias):
+                        expert_id = buffer_ops.buffer_load(
+                            topk_rsrc, in_row, vec_width=1, dtype=i32
+                        )
+                        bias_row = expert_id * inter_dim2_i32
                     in_row_byte_base = in_row * arith.constant(
                         inter_dim * 2 * elem_bytes_bf16, type=i32
                     )
