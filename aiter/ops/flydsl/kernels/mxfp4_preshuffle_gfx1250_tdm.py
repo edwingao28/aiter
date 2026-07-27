@@ -325,7 +325,7 @@ def launch_gemm_a8w4_tdm(
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
+        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None, pretetch_all):
             act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
                 act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
@@ -340,9 +340,12 @@ def launch_gemm_a8w4_tdm(
             if const_expr(len(BACK) > 0):
                 rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
-            return load_b_and_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
+            # return load_b_and_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
+            if not tail:
+                load_subtile(prefetch_all)
+            return prefetch_all
 
-        def compute_ktile(buf, prefetch_kt):
+        def compute_ktile(buf, prefetch_kt, prefetch_all):
             prev = load_b_and_scales(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
@@ -357,6 +360,7 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(ks < KWS - 1):
                     rocdl.sched_dsrd(BS_DS)
             rocdl.sched_barrier(0)
+            return prefetch_all
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
@@ -369,20 +373,28 @@ def launch_gemm_a8w4_tdm(
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
+
+                tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                workgroup_barrier()
+
+                prefetech_all = prefetch_subtile(a0, b0, as0, bs0) # all means a b as bs
                 n_steady = K_TILES - num_buffers
                 for kt in range(n_steady):
                     s = kt % num_buffers
                     buf = ptr_to_idx(buf_ptr(s))
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
-                    compute_ktile(buf, None)
+                    compute_ktile(buf, None, prefetch_all)
                     workgroup_barrier()
                     issue(s, kt + num_buffers)
+
+                    prefetch_all = prefetch_subtile() # next tile's subtile
+
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                    compute_ktile(buf, None)
+                    compute_ktile(buf, None, prefetch_all)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m).
                 for i in range_constexpr(num_buffers - 1):
