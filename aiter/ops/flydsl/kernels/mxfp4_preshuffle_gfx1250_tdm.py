@@ -12,6 +12,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops, vector
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from .gemm_common_gfx1250 import (
+    lds_addr_keepalive,
     lds_load_b32_raw,
     lds_load_b128_raw,
     lds_store_b32_raw,
@@ -269,26 +270,48 @@ def launch_gemm_a8w4_tdm(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        def load_a(buf, wm, ksl):
-            row = wmb + wm * 16 + lane16
-            b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
+        # Per-region LDS base offsets. These depend only on the wave/lane (wmb, wnb,
+        # lane16, kgrp) and the per-slot buffer pointer -- they are fully invariant
+        # across the k-loop (kt) and the subtile index (ksl). So the address of every
+        # ds_load splits into (a) a base = buf + <lane-invariant offset>, precomputed
+        # ONCE per ping-pong slot before the loop, plus (b) a pure compile-time
+        # immediate that varies with wm/wn/ksl/j. This removes the per-subtile base
+        # v_add (and the s_wait_alu that gated the dependent ds_load) from the loop.
+        #   A : row = wmb + wm*16 + lane16 ; immediate = wm*16*A_LDS_ROW + ksl*A_KSTEP (+32*j)
+        #   B : immediate = wn*B_LDS_ROW + ksl*1024 (+512)
+        #   SA: warp_lds_row = wmb//wmma_m_rep + lane16 ; immediate = (ksl*wmma_m_rep + wm)*4
+        #   SB: wnb%32==0 and 0<=lane16<16 => col_rel//32 == wnb//32 + wn//2,
+        #       col_rel%32 == lane16 + (wn%2)*16 exactly ; immediate = ((wn//2)*SC_INNER
+        #       + ksl*32 + (wn%2)*16)*4
+        _idx = lambda v: fx.index_cast(T.index, v)
+        a_lane = _idx((wmb + lane16) * A_LDS_ROW + kgrp * 16)
+        b_lane = _idx(STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16)
+        sa_lane = _idx(SA_OFF + (wmb // wmma_m_rep + lane16) * (AS_INNER * 4) + kgrp * 4)
+        sb_lane = _idx(SB_OFF + ((wnb // 32) * SC_INNER + lane16) * 4)
+
+        def bases_of(buf):
+            return (buf + a_lane, buf + b_lane, buf + sa_lane, buf + sb_lane)
+
+        # Offsets below are compile-time constants; wrap in Int32 so the raw loader
+        # gets an MLIR value that the backend folds into the ds_load immediate field.
+        def load_a(base, wm, ksl):
+            off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             if const_expr(a_is_fp4):
-                return Vec(lds_load_b128_raw(buf, b0)).shuffle(Vec(lds_load_b128_raw(buf, b0 + 32)), list(range(8)))
-            v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+                return Vec(lds_load_b128_raw(base, fx.Int32(off))).shuffle(
+                    Vec(lds_load_b128_raw(base, fx.Int32(off + 32))), list(range(8)))
+            v = [Vec(lds_load_b128_raw(base, fx.Int32(off + 32 * j))) for j in range_constexpr(4)]
             return v[0].shuffle(v[1], list(range(8))).shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
 
-        def load_b(buf, wn, ksl):
-            b0 = STAGE_A + (wnb // 16 + wn) * B_LDS_ROW + ksl * 1024 + kgrp * 256 + lane16 * 16
-            return Vec(lds_load_b128_raw(buf, b0)).shuffle(Vec(lds_load_b128_raw(buf, b0 + 512)), list(range(8)))
+        def load_b(base, wn, ksl):
+            off = wn * B_LDS_ROW + ksl * 1024
+            return Vec(lds_load_b128_raw(base, fx.Int32(off))).shuffle(
+                Vec(lds_load_b128_raw(base, fx.Int32(off + 512))), list(range(8)))
 
-        def load_sa(buf, wm, ksl):
-            warp_lds_row = wmb // wmma_m_rep + lane16
-            byte = warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
-            return lds_load_b32_raw(buf, SA_OFF + byte)
+        def load_sa(base, wm, ksl):
+            return lds_load_b32_raw(base, fx.Int32((ksl * wmma_m_rep + wm) * 4))
 
-        def load_sb(buf, wn, ksl):
-            col_rel = wnb + wn * 16 + lane16
-            return lds_load_b32_raw(buf, SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4)
+        def load_sb(base, wn, ksl):
+            return lds_load_b32_raw(base, fx.Int32(((wn // 2) * SC_INNER + ksl * 32 + (wn % 2) * 16) * 4))
 
         wmma_atom = fx.make_mma_atom(
             fx.rocdl.WMMAScale(WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32)
@@ -320,15 +343,17 @@ def launch_gemm_a8w4_tdm(
         BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
 
         def load_b_and_scales(buf, ksl):
-            wt = [to_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
-            sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
-            sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            _, bb, bsa, bsb = bases_of(buf)
+            wt = [to_rmem(8, load_b(bb, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
+            sb_k = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
+            sa_k = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
         def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
-            act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
+            ba = buf + a_lane
+            act_f = [to_rmem(ACT_NDW, load_a(ba, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
-                act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
+                act_b = [to_rmem(ACT_NDW, load_a(ba, wm, ksl)) for wm in BACK]
                 rocdl.s_wait_dscnt(len(BACK) * DS_A)
             else:
                 rocdl.s_wait_dscnt(0)
@@ -363,37 +388,57 @@ def launch_gemm_a8w4_tdm(
         # across the rolled k-tile loop (same mechanism as c_frags). The tile-boundary
         # prefetch (last subtile -> next tile's subtile 0) overlaps the compute of the
         # previous tile's last subtile. Slot = subtile parity; KWS even keeps the tile
-        # boundary on slot 0 (compile-time). Scales stay on-demand (cheap b32 reads).
+        # boundary on slot 0 (compile-time).
         AB_DS = wmma_m_rep * DS_A + wmma_n_rep * DS_B
         PF_OK = (KWS % 2 == 0)
         pf_act = [[fx.make_rmem_tensor(ACT_NDW, fx.Int32) for _ in range_constexpr(wmma_m_rep)]
                   for _ in range_constexpr(2)]
         pf_wt = [[fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
                  for _ in range_constexpr(2)]
+        # All scales for a subtile packed into one rmem tensor per ping-pong slot.
+        # rmem SSA promotion is built for *vector* store/load; a width-1 vector
+        # leaves a poison lane, so pack sa (wmma_m_rep) + sb (wmma_n_rep) together
+        # (width >= 2) and slice on read.
+        SC_W = wmma_m_rep + wmma_n_rep
+        pf_sc = [fx.make_rmem_tensor(SC_W, fx.Int32) for _ in range_constexpr(2)]
 
-        def pf_load(p, buf, ksl):
+        def pf_load(p, bases, ksl):
+            ba, bb, bsa, bsb = bases
             for wm in range_constexpr(wmma_m_rep):
-                pf_act[p][wm].store(load_a(buf, wm, ksl))
+                pf_act[p][wm].store(load_a(ba, wm, ksl))
             for wn in range_constexpr(wmma_n_rep):
-                pf_wt[p][wn].store(load_b(buf, wn, ksl))
+                pf_wt[p][wn].store(load_b(bb, wn, ksl))
+            # Pack all scales into one wide rmem vector store. from_elements
+            # consumes the ds-reads exactly like load_a/load_b's shuffle, so the
+            # backend tracks the ds->pack dependency; no manual wait here.
+            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
+            pf_sc[p].store(Vec.from_elements(sa_v + sb_v))
+            # Keep ALL four region base-address registers live past the scale
+            # ds_loads so the allocator can't reuse them as scale destinations
+            # (reuse forces s_wait_alu depctr_vm_vsrc WAR gates in the scale
+            # stream while the A/B loads off those bases are still in flight).
+            # Must pin all four: pinning only A/B leaves the SA/SB bases to be
+            # reused and measures slower than baseline; all four nets ~2% on
+            # gemm1 (relies on the VGPR headroom at floor occupancy, no spill).
+            lds_addr_keepalive(ba, bb, bsa, bsb)
 
-        def pf_step(cur_p, cur_buf, cur_ksl, nxt):
-            # nxt = (slot, buf, ksl) to prefetch one subtile ahead, or None on the
-            # very last subtile (final drain). Invariant on entry: exactly AB_DS
-            # ds_reads outstanding (this subtile's A/B, prefetched last step).
-            sa_k = [load_sa(cur_buf, wm, cur_ksl) for wm in range_constexpr(wmma_m_rep)]
-            sb_k = [load_sb(cur_buf, wn, cur_ksl) for wn in range_constexpr(wmma_n_rep)]
+        def pf_step(cur_p, nxt):
+            # nxt = (rmem_slot p, precomputed region bases, ksl) or None. The bases
+            # are precomputed once per slot, so pf_load only emits ds_loads + immediates.
             if const_expr(nxt is not None):
                 pf_load(nxt[0], nxt[1], nxt[2])
-                rocdl.s_wait_dscnt(AB_DS)
-            else:
-                rocdl.s_wait_dscnt(0)
+            rocdl.sched_barrier(0)
+            sc = pf_sc[cur_p].load()
+            _sa_pf = [sc[wm] for wm in range_constexpr(wmma_m_rep)]
+            _sb_pf = [sc[wmma_m_rep + wn] for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
                 for wn_raw in range_constexpr(wmma_n_rep):
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(wmma_atom, c_frags[idx], pf_wt[cur_p][wn], pf_act[cur_p][wm],
-                            c_frags[idx], scale_a=sb_k[wn], scale_b=sa_k[wm])
+                            c_frags[idx], scale_a=_sb_pf[wn], scale_b=_sa_pf[wm])
+            rocdl.sched_barrier(0)
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
@@ -412,29 +457,43 @@ def launch_gemm_a8w4_tdm(
                     # across the rolled k-loop via fixed ping-pong rmem. The wait is
                     # rotated up: keep tiles kt AND kt+1 resident (count nb-2) so the
                     # tile-boundary prefetch of tile kt+1's subtile 0 is race-free.
+                    #
+                    # Region bases split into base = buf + <lane offset> plus a
+                    # compile-time immediate folded into the ds_load. buf alternates
+                    # with the k-tile parity across the two LDS slots; because PITCH
+                    # (0x19c00) far exceeds the ds_load immediate range, the slot must
+                    # live in the address register, so one base v_add per slot per kt
+                    # is unavoidable (the backend rematerializes it from the loop
+                    # counter parity regardless of whether the source precomputes,
+                    # unrolls, or loop-carries the base -- all canonicalize to the
+                    # same code). We still form all region bases up front so no base
+                    # v_add is interleaved mid-way through the ds_load stream.
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
-                    pf_load(0, ptr_to_idx(buf_ptr(0)), 0)
+                    pf_load(0, bases_of(ptr_to_idx(buf_ptr(0))), 0)
                     for kt in range(n_steady):
                         s = kt % num_buffers
-                        buf = ptr_to_idx(buf_ptr(s))
-                        buf1 = ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                        bases = bases_of(ptr_to_idx(buf_ptr(s)))
+                        bases1 = bases_of(ptr_to_idx(buf_ptr((kt + 1) % num_buffers)))
                         for ksl in range_constexpr(KWS):
-                            nxt = ((((ksl + 1) % 2), buf, ksl + 1) if const_expr(ksl < KWS - 1)
-                                   else (0, buf1, 0))
-                            pf_step(ksl % 2, buf, ksl, nxt)
-                        workgroup_barrier()
-                        issue(s, kt + num_buffers)
+                            if const_expr(ksl == KWS - 1):
+                                workgroup_barrier()
+                                issue(s, kt + num_buffers)
+                                pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                            nxt = ((((ksl + 1) % 2), bases, ksl + 1) if const_expr(ksl < KWS - 1)
+                                   else (0, bases1, 0))
+                            pf_step(ksl % 2, nxt)
+
                     pipeline_fence(outstanding=0)
                     for j in range_constexpr(num_buffers):
                         kt = n_steady + j
-                        buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                        buf1 = ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        s = kt % num_buffers
+                        bases = bases_of(ptr_to_idx(buf_ptr(s)))
+                        bases1 = bases_of(ptr_to_idx(buf_ptr((kt + 1) % num_buffers)))
                         has_next = kt + 1 < K_TILES
                         for ksl in range_constexpr(KWS):
-                            nxt = ((((ksl + 1) % 2), buf, ksl + 1) if const_expr(ksl < KWS - 1)
-                                   else ((0, buf1, 0) if const_expr(has_next) else None))
-                            pf_step(ksl % 2, buf, ksl, nxt)
+                            nxt = ((((ksl + 1) % 2), bases, ksl + 1) if const_expr(ksl < KWS - 1)
+                                   else ((0, bases1, 0) if const_expr(has_next) else None))
+                            pf_step(ksl % 2, nxt)
                 else:
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
