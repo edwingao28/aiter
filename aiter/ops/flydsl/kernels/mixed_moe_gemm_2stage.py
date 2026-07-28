@@ -66,6 +66,7 @@ from .mfma_preshuffle_pipeline import (
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .layout_utils import crd2idx, idx2crd, get as layout_get
+from .lds_dma_policy import select_raw_ptr_buffer_load_lds_bytes
 
 
 @contextmanager
@@ -5593,23 +5594,9 @@ def compile_mixed_moe_gemm1_a16w4(
                     else None
                 )
 
-                if const_expr(
-                    bytes_per_thread_x >= 16 and bytes_per_thread_x % 16 == 0
-                ):
-                    x_load_bytes = 16
-                elif const_expr(
-                    bytes_per_thread_x >= 8 and bytes_per_thread_x % 8 == 0
-                ):
-                    x_load_bytes = 8
-                elif const_expr(
-                    bytes_per_thread_x >= 4 and bytes_per_thread_x % 4 == 0
-                ):
-                    x_load_bytes = 4
-                else:
-                    raise ValueError(
-                        f"bytes_per_thread_x ({bytes_per_thread_x}) must be "
-                        f"divisible by 4"
-                    )
+                x_load_bytes = select_raw_ptr_buffer_load_lds_bytes(
+                    gpu_arch, bytes_per_thread_x
+                )
                 num_x_loads = bytes_per_thread_x // x_load_bytes
                 chunk_i32 = x_load_bytes // 4
                 x_vec_elems = x_load_bytes // elem_bytes
@@ -5668,7 +5655,7 @@ def compile_mixed_moe_gemm1_a16w4(
                 wave_id = layout_get(coord_wl, 0)
                 lane_id = layout_get(coord_wl, 1)
 
-                _dma_bytes = 16
+                _dma_bytes = x_load_bytes
                 _wave_size = 64
 
                 def dma_x_tile_to_lds(base_k, lds_buffer):
@@ -7871,23 +7858,9 @@ def compile_mixed_moe_gemm2_a16w4(
                     # For A16W4, _sort_block_m == tile_m so generic's sort_blk = bx
                     # yields the same expert_idx as the original A16W4 path.
 
-                    if const_expr(
-                        bytes_per_thread_x >= 16 and bytes_per_thread_x % 16 == 0
-                    ):
-                        x_load_bytes = 16
-                    elif const_expr(
-                        bytes_per_thread_x >= 8 and bytes_per_thread_x % 8 == 0
-                    ):
-                        x_load_bytes = 8
-                    elif const_expr(
-                        bytes_per_thread_x >= 4 and bytes_per_thread_x % 4 == 0
-                    ):
-                        x_load_bytes = 4
-                    else:
-                        raise ValueError(
-                            f"bytes_per_thread_x ({bytes_per_thread_x}) must be "
-                            f"divisible by 4"
-                        )
+                    x_load_bytes = select_raw_ptr_buffer_load_lds_bytes(
+                        gpu_arch, bytes_per_thread_x
+                    )
                     num_x_loads = bytes_per_thread_x // x_load_bytes
                     chunk_i32 = x_load_bytes // 4
                     _a16_vec16_x = T.vec(8, _a16_x_elem)
@@ -7952,7 +7925,7 @@ def compile_mixed_moe_gemm2_a16w4(
                     # wave_id / lane_id / lane_div_16 / lane_mod_16 come from the
                     # shared preamble above.
 
-                    _dma_bytes = 16
+                    _dma_bytes = x_load_bytes
                     _wave_size = 64
 
                     def dma_x_tile_to_lds(base_k, lds_buffer):
