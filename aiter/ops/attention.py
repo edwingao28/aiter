@@ -1511,7 +1511,7 @@ def mla_reduce_v1(
         max_seqlen_q: max query length (tokens) per decode step.
         num_kv_splits: sizing hint for the reducer's per-split LDS scratch
             (``max_splits = max(device_cu_count, num_kv_splits)``).
-            **``0`` means auto** — size to the device CU count. Pass a value
+            **``0`` means auto** -- size to the device CU count. Pass a value
             larger than the CU count only to force a bigger split budget;
             values <= CU count (incl. 0) are clamped up to it.
         final_output: [bs, h, dv]. Combined, normalized output (written
@@ -1834,7 +1834,7 @@ def hk_mla_v40_decode_fwd(
         )
 
 
-@compile_ops("module_ds32_mla")
+@compile_ops("module_ds32_mla", develop=True)
 def mla_decode_stage1_opus_fwd_ds32(
     q_nope: torch.Tensor,  # [B, H, D_NOPE]          fp8
     q_rope: torch.Tensor,  # [B, H, D_ROPE]          bf16
