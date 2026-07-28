@@ -6144,6 +6144,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                     arith,
                                     vector,
                                     scale_f32=g_scales[ku][ni],
+                                    use_hw_cvt=bf16_mfma_k == 32,
                                 )
                                 if const_expr(up_list is not None):
                                     u_raw_ku = vector.extract(
@@ -6156,6 +6157,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                         arith,
                                         vector,
                                         scale_f32=u_scales[ku][ni],
+                                        use_hw_cvt=bf16_mfma_k == 32,
                                     )
 
                                 for mi in range_constexpr(m_repeat):
@@ -6213,6 +6215,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                     arith,
                                     vector,
                                     scale_f32=g_scales[ku][ni],
+                                    use_hw_cvt=bf16_mfma_k == 32,
                                 )
                                 if const_expr(up_list is not None):
                                     u_raw_ku = vector.extract(
@@ -6225,6 +6228,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                         arith,
                                         vector,
                                         scale_f32=u_scales[ku][ni],
+                                        use_hw_cvt=bf16_mfma_k == 32,
                                     )
 
                                 for mi in range_constexpr(m_repeat):
@@ -8339,6 +8343,7 @@ def compile_mixed_moe_gemm2_a16w4(
                                     arith,
                                     vector,
                                     scale_f32=b_scales[ku][ni],
+                                    use_hw_cvt=bf16_mfma_k == 32,
                                 )
 
                                 for mi in range_constexpr(m_repeat):
