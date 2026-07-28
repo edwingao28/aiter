@@ -645,12 +645,11 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "-k",
     "--topk",
     type=int,
     default=9,
     help="""Number of top experts.
-    e.g.: -k 2""",
+    e.g.: --topk 2""",
 )
 
 parser.add_argument(
@@ -724,7 +723,7 @@ parser.add_argument(
     ),
 )
 
-args = parser.parse_args()
+args, _ = parser.parse_known_args()
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
