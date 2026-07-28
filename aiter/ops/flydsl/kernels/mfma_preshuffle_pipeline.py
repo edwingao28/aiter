@@ -1059,30 +1059,27 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
     v1 = vector.from_elements(vec1_i32_t, [packed4])
     i8x4 = vector.bitcast(vec4_i8, v1)
 
-    c1 = arith.constant(1, type=T.i32)
-    c3_shift = arith.constant(3, type=T.i32)
-    c7 = arith.constant(7, type=T.i32)
-    c22 = arith.constant(22, type=T.i32)
-    c23 = arith.constant(23, type=T.i32)
-    c31 = arith.constant(31, type=T.i32)
-    c126 = arith.constant(126, type=T.i32)
-    c_zero = arith.constant(0, type=T.i32)
-    c_half_bits = arith.constant(0x3F000000, type=T.i32)  # 0.5f
+    c1 = fx.Int32(1)
+    c3_shift = fx.Int32(3)
+    c7 = fx.Int32(7)
+    c22 = fx.Int32(22)
+    c23 = fx.Int32(23)
+    c31 = fx.Int32(31)
+    c126 = fx.Int32(126)
+    c_zero = fx.Int32(0)
+    c_half_bits = fx.Int32(0x3F000000)  # 0.5f
 
     f32_vals = []
     for i in range(4):
         nibble_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
         n = arith.extui(T.i32, nibble_i8)
 
-        sign_bit = arith.andi(arith.shrui(n, c3_shift), c1)
-        unsigned_val = arith.andi(n, c7)
-        exp_field = arith.shrui(unsigned_val, c1)
-        mant_field = arith.andi(unsigned_val, c1)
+        sign_bit = (n >> c3_shift) & c1
+        unsigned_val = n & c7
+        exp_field = unsigned_val >> c1
+        mant_field = unsigned_val & c1
 
-        f32_norm = arith.ori(
-            arith.shli(arith.addi(exp_field, c126), c23),
-            arith.shli(mant_field, c22),
-        )
+        f32_norm = ((exp_field + c126) << c23) | (mant_field << c22)
 
         is_zero = arith.cmpi(CmpIPredicate.eq, unsigned_val, c_zero)
         is_subnorm = arith.cmpi(CmpIPredicate.eq, unsigned_val, c1)
@@ -1091,7 +1088,7 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
             is_zero, c_zero,
             arith.select(is_subnorm, c_half_bits, f32_norm),
         )
-        f32_bits = arith.ori(f32_bits, arith.shli(sign_bit, c31))
+        f32_bits = f32_bits | (sign_bit << c31)
 
         v = arith.bitcast(T.f32, f32_bits)
         if scale_f32 is not None:
@@ -1257,26 +1254,26 @@ def _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32):
 
 def _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32):
     """Software fallback for non-GFX950 targets."""
-    c_0f = arith.constant(0x0F, type=T.i32)
-    c4 = arith.constant(4, type=T.i32)
-    c8 = arith.constant(8, type=T.i32)
-    c12 = arith.constant(12, type=T.i32)
-    c16 = arith.constant(16, type=T.i32)
-    c20 = arith.constant(20, type=T.i32)
-    c24 = arith.constant(24, type=T.i32)
-    c28 = arith.constant(28, type=T.i32)
+    c_0f = fx.Int32(0x0F)
+    c4 = fx.Int32(4)
+    c8 = fx.Int32(8)
+    c12 = fx.Int32(12)
+    c16 = fx.Int32(16)
+    c20 = fx.Int32(20)
+    c24 = fx.Int32(24)
+    c28 = fx.Int32(28)
 
     n0 = packed32 & c_0f
-    n1 = arith.shrui(packed32, c4) & c_0f
-    n2 = arith.shrui(packed32, c8) & c_0f
-    n3 = arith.shrui(packed32, c12) & c_0f
-    first = n0 | arith.shli(n1, c8) | arith.shli(n2, c16) | arith.shli(n3, c24)
+    n1 = (packed32 >> c4) & c_0f
+    n2 = (packed32 >> c8) & c_0f
+    n3 = (packed32 >> c12) & c_0f
+    first = n0 | (n1 << c8) | (n2 << c16) | (n3 << c24)
 
-    n4 = arith.shrui(packed32, c16) & c_0f
-    n5 = arith.shrui(packed32, c20) & c_0f
-    n6 = arith.shrui(packed32, c24) & c_0f
-    n7 = arith.shrui(packed32, c28) & c_0f
-    second = n4 | arith.shli(n5, c8) | arith.shli(n6, c16) | arith.shli(n7, c24)
+    n4 = (packed32 >> c16) & c_0f
+    n5 = (packed32 >> c20) & c_0f
+    n6 = (packed32 >> c24) & c_0f
+    n7 = (packed32 >> c28) & c_0f
+    second = n4 | (n5 << c8) | (n6 << c16) | (n7 << c24)
 
     b0 = _fp4x4_in_i32_to_bf16x4_i64(first, arith, vector, scale_f32=scale_f32)
     b1 = _fp4x4_in_i32_to_bf16x4_i64(second, arith, vector, scale_f32=scale_f32)

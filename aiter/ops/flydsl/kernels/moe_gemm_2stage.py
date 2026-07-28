@@ -1699,7 +1699,7 @@ def compile_moe_gemm1(
                     x_regs0, lds_base_cur
                 )  # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
-                _barrier(vmcnt=0, lgkmcnt=0)
+                gpu.barrier()
 
                 # Loop-carried ping/pong state.
                 lds_base_pong = lds_base_cur  # current/compute
@@ -1823,7 +1823,7 @@ def compile_moe_gemm1(
                     )
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
-                    _barrier(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
 
                     _a0pf_ping = lds_load_packs_k64(
                         row_a_lds, col_offset_base_bytes, lds_base_ping
@@ -1851,7 +1851,7 @@ def compile_moe_gemm1(
                     )
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
-                    _barrier(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
 
                     _a0pf_new = lds_load_packs_k64(
                         row_a_lds, col_offset_base_bytes, lds_base_pong
@@ -1895,7 +1895,7 @@ def compile_moe_gemm1(
                 a0_prefetch_pong = None
                 store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                 hot_loop_scheduler()
-                _barrier(vmcnt=0, lgkmcnt=0)
+                gpu.barrier()
 
                 a0_prefetch_ping = lds_load_packs_k64(
                     row_a_lds, col_offset_base_bytes, lds_base_ping
@@ -3946,7 +3946,7 @@ def compile_moe_gemm2(
                     x_regs0, lds_base_cur
                 )  # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
-                _barrier(vmcnt=0, lgkmcnt=0)
+                gpu.barrier()
 
                 acc = [acc_init] * (num_acc_n * m_repeat)
                 lds_base_pong = lds_base_cur
@@ -4042,7 +4042,7 @@ def compile_moe_gemm2(
                     _ac, _ = compute_tile(_ac, _bc, lds_base_pong, a0_prefetch=_a0)
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
-                    _barrier(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
 
                     _a0p = lds_load_packs_k64(
                         row_a_lds, col_offset_base_bytes, lds_base_ping
@@ -4057,7 +4057,7 @@ def compile_moe_gemm2(
                     _ac, _ = compute_tile(_ac, _bp, lds_base_ping, a0_prefetch=_a0p)
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
-                    _barrier(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
 
                     _a0n = lds_load_packs_k64(
                         row_a_lds, col_offset_base_bytes, lds_base_pong
@@ -4092,7 +4092,7 @@ def compile_moe_gemm2(
                     )
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
-                    _barrier(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
 
                     a0_prefetch_ping = lds_load_packs_k64(
                         row_a_lds, col_offset_base_bytes, lds_base_ping
