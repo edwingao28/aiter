@@ -15,6 +15,9 @@ MFMA_POLICY_PATH = REPO_ROOT / "aiter" / "ops" / "flydsl" / "kernels" / "mfma_po
 MIXED_MOE_PATH = (
     REPO_ROOT / "aiter" / "ops" / "flydsl" / "kernels" / "mixed_moe_gemm_2stage.py"
 )
+PRESHUFFLE_PIPELINE_PATH = (
+    REPO_ROOT / "aiter" / "ops" / "flydsl" / "kernels" / "mfma_preshuffle_pipeline.py"
+)
 
 
 def load_policy_module(path: Path, module_name: str):
@@ -221,6 +224,23 @@ class TestA16W4Bf16MfmaPolicy(unittest.TestCase):
                         ast.dump(ast.parse("bf16_mfma_k == 32", mode="eval").body),
                         f"{name} must use software FP4 decode with the gfx94 K16 path",
                     )
+
+    def test_software_mxfp4_decode_preserves_k16_operand_order(self) -> None:
+        source = PRESHUFFLE_PIPELINE_PATH.read_text()
+        tree = ast.parse(source)
+        function_source = next(
+            ast.get_source_segment(source, node)
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_unpack_b_mxfp4_bf16_sw"
+        )
+
+        self.assertIn("nibble_mask = arith.constant(0x0F0F0F0F", function_source)
+        self.assertIn("even = packed32 & nibble_mask", function_source)
+        self.assertIn(
+            "odd = arith.shrui(packed32, c4) & nibble_mask",
+            function_source,
+        )
 
 
 if __name__ == "__main__":
