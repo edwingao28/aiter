@@ -145,14 +145,14 @@ def make_preshuffle_scale_layout(
         )
 
     if klane_inner:
-        stride_klane = fx.Index(1)       # KLane innermost
-        stride_nlane = c4                 # c4 = fx.Index(4)
-        stride_k0 = c16 * c4             # = 64
+        stride_klane = fx.Index(1)  # KLane innermost
+        stride_nlane = c4  # c4 = fx.Index(4)
+        stride_k0 = c16 * c4  # = 64
         stride_n0 = c_k1 * stride_k0
     else:
-        stride_klane = c16               # KLane at stride 16
-        stride_nlane = fx.Index(1)       # NLane innermost
-        stride_k0 = c4 * stride_klane    # = 64
+        stride_klane = c16  # KLane at stride 16
+        stride_nlane = fx.Index(1)  # NLane innermost
+        stride_k0 = c4 * stride_klane  # = 64
         stride_n0 = c_k1 * stride_k0
 
     c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
@@ -164,12 +164,12 @@ def make_preshuffle_scale_layout(
 
     if klane_inner:
         layout_scale = fx.make_layout(
-            (c_mn1_i32, c_k1_i32, 16, 4),   # NLane=16, KLane=4
+            (c_mn1_i32, c_k1_i32, 16, 4),  # NLane=16, KLane=4
             stride=(stride_n0_i32, stride_k0_i32, stride_nlane_i32, stride_klane_i32),
         )
     else:
         layout_scale = fx.make_layout(
-            (c_mn1_i32, c_k1_i32, 4, 16),   # KLane=4, NLane=16
+            (c_mn1_i32, c_k1_i32, 4, 16),  # KLane=4, NLane=16
             stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
         )
 
@@ -242,12 +242,14 @@ def make_preshuffle_b_layout(
         c_k0 = c_k_bytes // c64
         klane_dim = 4
 
-        stride_dim2 = c_kpack_elems              # L_sub stride = kpack (16)
-        stride_dim3 = c4 * c_kpack_elems          # NLane stride = 4*16 = 64
-        stride_k0 = c16 * stride_dim3             # K0 stride = 16*64 = 1024
+        stride_dim2 = c_kpack_elems  # L_sub stride = kpack (16)
+        stride_dim3 = c4 * c_kpack_elems  # NLane stride = 4*16 = 64
+        stride_k0 = c16 * stride_dim3  # K0 stride = 16*64 = 1024
         stride_n0 = c_k0 * stride_k0
 
-        kpack_elems_static = kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
+        kpack_elems_static = (
+            kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
+        )
         n0_i32 = arith.index_cast(T.i32, n0)
         c_k0_i32 = arith.index_cast(T.i32, c_k0)
         stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
@@ -1029,12 +1031,14 @@ def _cvt_scalef32_pk_bf16_fp4(packed_i32, scale_f32, byte_idx, arith, vector):
         T.vec(2, T.bf16),
         "llvm.amdgcn.cvt.scalef32.pk.bf16.fp4",
         [packed_i32, scale_f32, byte_idx_i32],
-        [], [],
+        [],
+        [],
     )
     vec1_i32_t = T.vec(1, T.i32)
     return vector.extract(
         vector.bitcast(vec1_i32_t, result_v2bf16),
-        static_position=[0], dynamic_position=[],
+        static_position=[0],
+        dynamic_position=[],
     )
 
 
@@ -1085,7 +1089,8 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
         is_subnorm = arith.cmpi(CmpIPredicate.eq, unsigned_val, c1)
 
         f32_bits = arith.select(
-            is_zero, c_zero,
+            is_zero,
+            c_zero,
             arith.select(is_subnorm, c_half_bits, f32_norm),
         )
         f32_bits = f32_bits | (sign_bit << c31)
@@ -1126,6 +1131,16 @@ def load_b_raw_mxfp4(
     kpack_bytes: int = 16,
 ):
     """Load 4 bytes of packed FP4 from a kpack=16 preshuffle layout.
+
+    Addressing for kpack=16 (``shuffle_weight_a16w4`` format):
+      - Layout shape: ``(n0, k0, klane=4, nlane=16, kpack=16)``
+      - The A-side LDS has klane stride = 8 bf16 elements, advancing
+        by 32 bf16 per ku step.  B must match: each klane loads 4 bytes
+        (8 FP4 = 8 K elements) at K_start = base_k + ku*32 + lane*8.
+      - In the preshuffle layout this maps to:
+          k0 = base_k//128 + ku//4
+          klane_hw = ku % 4          (compile-time)
+          kpack_byte = lane_div_16*4  (runtime)
 
     Returns a single i32 containing 4 packed bytes (8 FP4 nibbles).
     """
@@ -1209,8 +1224,7 @@ def load_b_raw_mxfp4_dwordx4(
     return vector.bitcast(T.vec(4, T.i32), b16)
 
 
-def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None,
-                         use_hw_cvt=True):
+def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None, use_hw_cvt=True):
     """Unpack 8 FP4 E2M1 nibbles (packed in i32) to 2 x i64 (8 bf16).
 
     Each byte of *packed32* holds two FP4 nibbles: low nibble = K_even,
