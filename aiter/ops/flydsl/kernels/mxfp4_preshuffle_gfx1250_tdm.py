@@ -325,7 +325,7 @@ def launch_gemm_a8w4_tdm(
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None, pretetch_all):
+        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
             act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
                 act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
@@ -340,12 +340,9 @@ def launch_gemm_a8w4_tdm(
             if const_expr(len(BACK) > 0):
                 rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
-            # return load_b_and_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
-            if not tail:
-                load_subtile(prefetch_all)
-            return prefetch_all
+            return load_b_and_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
 
-        def compute_ktile(buf, prefetch_kt, prefetch_all):
+        def compute_ktile(buf, prefetch_kt):
             prev = load_b_and_scales(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
@@ -360,7 +357,43 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(ks < KWS - 1):
                     rocdl.sched_dsrd(BS_DS)
             rocdl.sched_barrier(0)
-            return prefetch_all
+
+        # ---- Full-subtile A/B register prefetch (post-issue path, KWS even) ----
+        # Carry A/B one subtile ahead in fixed ping-pong rmem so the bundle persists
+        # across the rolled k-tile loop (same mechanism as c_frags). The tile-boundary
+        # prefetch (last subtile -> next tile's subtile 0) overlaps the compute of the
+        # previous tile's last subtile. Slot = subtile parity; KWS even keeps the tile
+        # boundary on slot 0 (compile-time). Scales stay on-demand (cheap b32 reads).
+        AB_DS = wmma_m_rep * DS_A + wmma_n_rep * DS_B
+        PF_OK = (KWS % 2 == 0)
+        pf_act = [[fx.make_rmem_tensor(ACT_NDW, fx.Int32) for _ in range_constexpr(wmma_m_rep)]
+                  for _ in range_constexpr(2)]
+        pf_wt = [[fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
+                 for _ in range_constexpr(2)]
+
+        def pf_load(p, buf, ksl):
+            for wm in range_constexpr(wmma_m_rep):
+                pf_act[p][wm].store(load_a(buf, wm, ksl))
+            for wn in range_constexpr(wmma_n_rep):
+                pf_wt[p][wn].store(load_b(buf, wn, ksl))
+
+        def pf_step(cur_p, cur_buf, cur_ksl, nxt):
+            # nxt = (slot, buf, ksl) to prefetch one subtile ahead, or None on the
+            # very last subtile (final drain). Invariant on entry: exactly AB_DS
+            # ds_reads outstanding (this subtile's A/B, prefetched last step).
+            sa_k = [load_sa(cur_buf, wm, cur_ksl) for wm in range_constexpr(wmma_m_rep)]
+            sb_k = [load_sb(cur_buf, wn, cur_ksl) for wn in range_constexpr(wmma_n_rep)]
+            if const_expr(nxt is not None):
+                pf_load(nxt[0], nxt[1], nxt[2])
+                rocdl.s_wait_dscnt(AB_DS)
+            else:
+                rocdl.s_wait_dscnt(0)
+            for wm in range_constexpr(wmma_m_rep):
+                for wn_raw in range_constexpr(wmma_n_rep):
+                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                    idx = wm * wmma_n_rep + wn
+                    fx.gemm(wmma_atom, c_frags[idx], pf_wt[cur_p][wn], pf_act[cur_p][wm],
+                            c_frags[idx], scale_a=sb_k[wn], scale_b=sa_k[wm])
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
@@ -373,28 +406,51 @@ def launch_gemm_a8w4_tdm(
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
-
-                tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                workgroup_barrier()
-
-                prefetech_all = prefetch_subtile(a0, b0, as0, bs0) # all means a b as bs
                 n_steady = K_TILES - num_buffers
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
+                if const_expr(PF_OK):
+                    # Full-subtile A/B register prefetch, one subtile ahead, carried
+                    # across the rolled k-loop via fixed ping-pong rmem. The wait is
+                    # rotated up: keep tiles kt AND kt+1 resident (count nb-2) so the
+                    # tile-boundary prefetch of tile kt+1's subtile 0 is race-free.
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                    pf_load(0, ptr_to_idx(buf_ptr(0)), 0)
+                    for kt in range(n_steady):
+                        s = kt % num_buffers
+                        buf = ptr_to_idx(buf_ptr(s))
+                        buf1 = ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                        for ksl in range_constexpr(KWS):
+                            nxt = ((((ksl + 1) % 2), buf, ksl + 1) if const_expr(ksl < KWS - 1)
+                                   else (0, buf1, 0))
+                            pf_step(ksl % 2, buf, ksl, nxt)
+                        workgroup_barrier()
+                        issue(s, kt + num_buffers)
+                    pipeline_fence(outstanding=0)
+                    for j in range_constexpr(num_buffers):
+                        kt = n_steady + j
+                        buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+                        buf1 = ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        has_next = kt + 1 < K_TILES
+                        for ksl in range_constexpr(KWS):
+                            nxt = ((((ksl + 1) % 2), buf, ksl + 1) if const_expr(ksl < KWS - 1)
+                                   else ((0, buf1, 0) if const_expr(has_next) else None))
+                            pf_step(ksl % 2, buf, ksl, nxt)
+                else:
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
-                    compute_ktile(buf, None, prefetch_all)
-                    workgroup_barrier()
-                    issue(s, kt + num_buffers)
-
-                    prefetch_all = prefetch_subtile() # next tile's subtile
-
-                for j in range_constexpr(num_buffers):
-                    kt = n_steady + j
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                    compute_ktile(buf, None, prefetch_all)
+                    for kt in range(n_steady):
+                        s = kt % num_buffers
+                        buf = ptr_to_idx(buf_ptr(s))
+                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                        workgroup_barrier()
+                        compute_ktile(buf, None)
+                        workgroup_barrier()
+                        issue(s, kt + num_buffers)
+                    for j in range_constexpr(num_buffers):
+                        kt = n_steady + j
+                        buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
+                        compute_ktile(buf, None)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m).
                 for i in range_constexpr(num_buffers - 1):
