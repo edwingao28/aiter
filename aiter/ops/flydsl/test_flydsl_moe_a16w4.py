@@ -35,11 +35,9 @@ import torch
 torch.set_default_device("cuda")
 
 import aiter
-from aiter import dtypes, QuantType, ActivationType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, torch_moe_stage1, torch_moe_stage2
-from aiter.ops.shuffle import shuffle_weight_a16w4, shuffle_scale_a16w4
-from aiter.utility.fp4_utils import e8m0_shuffle
-from aiter.test_common import checkAllclose
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 Q_TYPE = QuantType.per_1x32
 Q_DTYPE_W = dtypes.fp4x2
@@ -164,33 +162,33 @@ def _generate_a16w4_data(
     w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False, klane_inner=klane_inner)
     w2_scale_shuf = shuffle_scale_a16w4(w2_scale, E, False, klane_inner=klane_inner)
 
-    return dict(
-        ref_stage1=ref1,
-        ref_stage2=ref2,
-        inp=inp,
-        w1_qt=w1_qt,
-        w1_qt_shuf=w1_qt_shuf,
-        w1_scale=w1_scale,
-        w1_scale_shuf=w1_scale_shuf,
-        w2_qt=w2_qt,
-        w2_qt_shuf=w2_qt_shuf,
-        w2_scale=w2_scale,
-        w2_scale_shuf=w2_scale_shuf,
-        sorted_ids=sorted_ids,
-        sorted_weights=sorted_weights,
-        sorted_weights_s1=sorted_weights_s1,
-        sorted_weights_s2=sorted_weights_s2,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        dtype=dtype,
-        token=token,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        E=E,
-        topk=topk,
-    )
+    return {
+        "ref_stage1": ref1,
+        "ref_stage2": ref2,
+        "inp": inp,
+        "w1_qt": w1_qt,
+        "w1_qt_shuf": w1_qt_shuf,
+        "w1_scale": w1_scale,
+        "w1_scale_shuf": w1_scale_shuf,
+        "w2_qt": w2_qt,
+        "w2_qt_shuf": w2_qt_shuf,
+        "w2_scale": w2_scale,
+        "w2_scale_shuf": w2_scale_shuf,
+        "sorted_ids": sorted_ids,
+        "sorted_weights": sorted_weights,
+        "sorted_weights_s1": sorted_weights_s1,
+        "sorted_weights_s2": sorted_weights_s2,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "dtype": dtype,
+        "token": token,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "E": E,
+        "topk": topk,
+    }
 
 
 def _check_result(ref_out, test_out, label, atol=1.0, rtol=0.05, pass_pct=95.0):
@@ -412,7 +410,12 @@ def test_flydsl_e2e_a16w4(
 
     ref = data["ref_stage2"]
     return _check_result(
-        ref, e2e_out, f"e2e_a16w4_{gate_mode}_{mode}", atol=atol, rtol=rtol, pass_pct=90.0
+        ref,
+        e2e_out,
+        f"e2e_a16w4_{gate_mode}_{mode}",
+        atol=atol,
+        rtol=rtol,
+        pass_pct=90.0,
     )
 
 
@@ -476,7 +479,7 @@ def main():
         for bm in args.block_m:
             if "stage1" in args.stage:
                 try:
-                    passed, max_delta, pct = test_flydsl_stage1_a16w4(
+                    passed, _max_delta, _pct = test_flydsl_stage1_a16w4(
                         token=token,
                         model_dim=args.model_dim,
                         inter_dim=args.inter_dim,
@@ -490,7 +493,7 @@ def main():
                     results.append(
                         (f"stage1_t{token}_bm{bm}", "PASS" if passed else "FAIL")
                     )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"  [ERROR] stage1 t={token} bm={bm}: {e}")
                     import traceback
 
@@ -500,7 +503,7 @@ def main():
             for mode in args.mode:
                 if "stage2" in args.stage:
                     try:
-                        passed, max_delta, pct = test_flydsl_stage2_a16w4(
+                        passed, _max_delta, _pct = test_flydsl_stage2_a16w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,
@@ -517,7 +520,7 @@ def main():
                                 "PASS" if passed else "FAIL",
                             )
                         )
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         print(f"  [ERROR] stage2 {mode} t={token} bm={bm}: {e}")
                         import traceback
 
@@ -528,7 +531,7 @@ def main():
 
                 if "e2e" in args.stage:
                     try:
-                        passed, max_delta, pct = test_flydsl_e2e_a16w4(
+                        passed, _max_delta, _pct = test_flydsl_e2e_a16w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,
@@ -546,14 +549,12 @@ def main():
                                 "PASS" if passed else "FAIL",
                             )
                         )
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         print(f"  [ERROR] e2e {mode} t={token} bm={bm}: {e}")
                         import traceback
 
                         traceback.print_exc()
-                        results.append(
-                            (f"e2e_{mode}_t{token}_bm{bm}", f"ERROR: {e}")
-                        )
+                        results.append((f"e2e_{mode}_t{token}_bm{bm}", f"ERROR: {e}"))
 
     print(f"\n{'='*70}")
     print("SUMMARY")

@@ -23,13 +23,13 @@ os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
-import torch
 import pytest
+import torch
 
 import aiter
-from aiter import dtypes, QuantType, ActivationType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe, fused_topk, get_gfx
-from aiter.ops.shuffle import shuffle_weight_a16w4, shuffle_scale_a16w4
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import checkAllclose
 
 

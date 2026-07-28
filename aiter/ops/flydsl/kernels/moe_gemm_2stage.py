@@ -1002,7 +1002,7 @@ def compile_moe_gemm1(
                     _mxfp4_weight_loads = num_acc_n * _mxfp4_k128_groups
                     _mxfp4_scale_loads = num_acc_n * _mxfp4_k128_groups
                     _b_vmem_per_tile = _mxfp4_weight_loads + _mxfp4_scale_loads
-                elif const_expr(is_fp4_bf16):
+                elif const_expr(is_fp4_bf16):  # noqa: SIM114
                     _b_vmem_per_tile = k_unroll * num_acc_n * 2
                 elif const_expr(is_int4_bf16_groupwise):
                     _b_vmem_per_tile = k_unroll * num_acc_n * 2
