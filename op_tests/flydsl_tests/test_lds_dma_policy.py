@@ -192,6 +192,35 @@ class TestA16W4Bf16MfmaPolicy(unittest.TestCase):
                     2,
                     f"{name} must cover each K32 tile with two K16 MFMAs",
                 )
+                fp4_unpack_calls = [
+                    node
+                    for node in ast.walk(function_tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "unpack_b_mxfp4_bf16"
+                ]
+                self.assertTrue(
+                    fp4_unpack_calls,
+                    f"{name} does not contain an MXFP4 decode",
+                )
+                for call in fp4_unpack_calls:
+                    use_hw_cvt = next(
+                        (
+                            keyword.value
+                            for keyword in call.keywords
+                            if keyword.arg == "use_hw_cvt"
+                        ),
+                        None,
+                    )
+                    self.assertIsNotNone(
+                        use_hw_cvt,
+                        f"{name} does not gate the gfx950-only FP4 conversion",
+                    )
+                    self.assertEqual(
+                        ast.dump(use_hw_cvt),
+                        ast.dump(ast.parse("bf16_mfma_k == 32", mode="eval").body),
+                        f"{name} must use software FP4 decode with the gfx94 K16 path",
+                    )
 
 
 if __name__ == "__main__":
