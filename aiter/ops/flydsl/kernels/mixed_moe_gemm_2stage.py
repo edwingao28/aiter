@@ -50,6 +50,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
 from .lds_dma_policy import select_raw_ptr_buffer_load_lds_bytes
+from .mfma_policy import select_a16w4_bf16_mfma_k
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
@@ -5063,21 +5064,37 @@ def compile_mixed_moe_gemm1_a16w4(
     out_is_f32 = out_s in ("f32", "fp32", "float")
     out_is_bf16 = out_s in ("bf16", "bfloat16")
 
-    # ---- A16W4-specific BF16 K32 MFMA helper ----
+    # ---- A16W4-specific BF16 MFMA helper ----
+    bf16_mfma_k = select_a16w4_bf16_mfma_k(gpu_arch)
+    mfma_f32_bf16_k16 = None
     mfma_f32_bf16_k32 = None
     if is_a16w4_stage1:
         if out_dtype not in ("f16", "bf16"):
             raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
-        _mfma_k32_raw = getattr(rocdl, "mfma_f32_16x16x32_bf16_", None)
-        if _mfma_k32_raw is None:
-            raise AttributeError(
-                "BF16 K32 MFMA op not found: expected `rocdl.mfma_f32_16x16x32_bf16_`"
-            )
-        _split_mfma = rocdl._split_mfma_operands
+        if bf16_mfma_k == 16:
+            mfma_f32_bf16_k16 = getattr(
+                rocdl, "mfma_f32_16x16x16bf16_1k", None
+            ) or getattr(rocdl, "mfma_f32_16x16x16_bf16_1k", None)
+            if mfma_f32_bf16_k16 is None:
+                raise AttributeError(
+                    "BF16 K16 MFMA op not found: expected "
+                    "`rocdl.mfma_f32_16x16x16bf16_1k` "
+                    "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)"
+                )
+        else:
+            _mfma_k32_raw = getattr(rocdl, "mfma_f32_16x16x32_bf16_", None)
+            if _mfma_k32_raw is None:
+                raise AttributeError(
+                    "BF16 K32 MFMA op not found: expected "
+                    "`rocdl.mfma_f32_16x16x32_bf16_`"
+                )
+            _split_mfma = rocdl._split_mfma_operands
 
-        def mfma_f32_bf16_k32(result_type, operands, *, loc=None, ip=None):
-            a, b, c, cbsz, abid, blgp = _split_mfma(operands)
-            return _mfma_k32_raw(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip)
+            def mfma_f32_bf16_k32(result_type, operands, *, loc=None, ip=None):
+                a, b, c, cbsz, abid, blgp = _split_mfma(operands)
+                return _mfma_k32_raw(
+                    result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip
+                )
 
     # ---- type helpers (A16W4 forces bf16 X / i8 W; generic dispatches on dtype flags) ----
     def out_mlir():
@@ -6063,7 +6080,22 @@ def compile_mixed_moe_gemm1_a16w4(
                         a_tiles[pl] = lds_load_packs_k64(row, col, lds_buffer)
                     return a_tiles
 
-                def _mfma_k32(acc_in, a0, a1, b0, b1):
+                def _i64_to_v4i16(value):
+                    value_v1 = vector.from_elements(T.vec(1, i64), [value])
+                    return vector.bitcast(T.vec(4, T.i16), value_v1)
+
+                def _mfma_k64(acc_in, a0, a1, b0, b1):
+                    if const_expr(bf16_mfma_k == 16):
+                        a0_v4 = _i64_to_v4i16(a0)
+                        a1_v4 = _i64_to_v4i16(a1)
+                        b0_v4 = _i64_to_v4i16(b0)
+                        b1_v4 = _i64_to_v4i16(b1)
+                        acc_mid = mfma_f32_bf16_k16(
+                            vec4_f32, [a0_v4, b0_v4, acc_in, 0, 0, 0]
+                        )
+                        return mfma_f32_bf16_k16(
+                            vec4_f32, [a1_v4, b1_v4, acc_mid, 0, 0, 0]
+                        )
                     a_v2 = vector.from_elements(vec2_i64, [a0, a1])
                     a_v8 = vector.bitcast(vec8_bf16, a_v2)
                     b_v2 = vector.from_elements(vec2_i64, [b0, b1])
@@ -6135,7 +6167,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                     _flat = ku * m_repeat + mi
                                     a0, a1 = a_preloaded[_flat]
                                     acc_idx = mi * num_acc_n + ni
-                                    gate_list[acc_idx] = _mfma_k32(
+                                    gate_list[acc_idx] = _mfma_k64(
                                         gate_list[acc_idx],
                                         a0,
                                         a1,
@@ -6143,7 +6175,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                         gb1,
                                     )
                                     if const_expr(up_list is not None):
-                                        up_list[acc_idx] = _mfma_k32(
+                                        up_list[acc_idx] = _mfma_k64(
                                             up_list[acc_idx],
                                             a0,
                                             a1,
@@ -6204,7 +6236,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                     _flat = ku * m_repeat + mi
                                     a0, a1 = all_a[_flat]
                                     acc_idx = mi * num_acc_n + ni
-                                    gate_list[acc_idx] = _mfma_k32(
+                                    gate_list[acc_idx] = _mfma_k64(
                                         gate_list[acc_idx],
                                         a0,
                                         a1,
@@ -6212,7 +6244,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                         gb1,
                                     )
                                     if const_expr(up_list is not None):
-                                        up_list[acc_idx] = _mfma_k32(
+                                        up_list[acc_idx] = _mfma_k64(
                                             up_list[acc_idx],
                                             a0,
                                             a1,
@@ -7291,20 +7323,36 @@ def compile_mixed_moe_gemm2_a16w4(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
         )
 
-    # A16W4-specific: BF16 K32 MFMA
+    # A16W4-specific: BF16 MFMA
+    bf16_mfma_k = select_a16w4_bf16_mfma_k(gpu_arch)
+    mfma_f32_bf16_k16 = None
     mfma_f32_bf16_k32 = None
     kpack_bytes = 16  # MXFP4 preshuffle (used by A16W4 body)
     if is_a16w4:
-        _mfma_k32_raw = getattr(rocdl, "mfma_f32_16x16x32_bf16_", None)
-        if _mfma_k32_raw is None:
-            raise AttributeError(
-                "BF16 K32 MFMA op not found: expected `rocdl.mfma_f32_16x16x32_bf16_`"
-            )
-        _split_mfma = rocdl._split_mfma_operands
+        if bf16_mfma_k == 16:
+            mfma_f32_bf16_k16 = getattr(
+                rocdl, "mfma_f32_16x16x16bf16_1k", None
+            ) or getattr(rocdl, "mfma_f32_16x16x16_bf16_1k", None)
+            if mfma_f32_bf16_k16 is None:
+                raise AttributeError(
+                    "BF16 K16 MFMA op not found: expected "
+                    "`rocdl.mfma_f32_16x16x16bf16_1k` "
+                    "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)"
+                )
+        else:
+            _mfma_k32_raw = getattr(rocdl, "mfma_f32_16x16x32_bf16_", None)
+            if _mfma_k32_raw is None:
+                raise AttributeError(
+                    "BF16 K32 MFMA op not found: expected "
+                    "`rocdl.mfma_f32_16x16x32_bf16_`"
+                )
+            _split_mfma = rocdl._split_mfma_operands
 
-        def mfma_f32_bf16_k32(result_type, operands, *, loc=None, ip=None):
-            a, b, c, cbsz, abid, blgp = _split_mfma(operands)
-            return _mfma_k32_raw(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip)
+            def mfma_f32_bf16_k32(result_type, operands, *, loc=None, ip=None):
+                a, b, c, cbsz, abid, blgp = _split_mfma(operands)
+                return _mfma_k32_raw(
+                    result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip
+                )
 
     def _x_elem_type():
         if is_a16w4:
@@ -8216,7 +8264,22 @@ def compile_mixed_moe_gemm2_a16w4(
                                 )
                         return a_tiles
 
-                    def _mfma_k32(acc_in, a0, a1, b0, b1):
+                    def _i64_to_v4i16(value):
+                        value_v1 = vector.from_elements(T.vec(1, i64), [value])
+                        return vector.bitcast(T.vec(4, T.i16), value_v1)
+
+                    def _mfma_k64(acc_in, a0, a1, b0, b1):
+                        if const_expr(bf16_mfma_k == 16):
+                            a0_v4 = _i64_to_v4i16(a0)
+                            a1_v4 = _i64_to_v4i16(a1)
+                            b0_v4 = _i64_to_v4i16(b0)
+                            b1_v4 = _i64_to_v4i16(b1)
+                            acc_mid = mfma_f32_bf16_k16(
+                                vec4_f32, [a0_v4, b0_v4, acc_in, 0, 0, 0]
+                            )
+                            return mfma_f32_bf16_k16(
+                                vec4_f32, [a1_v4, b1_v4, acc_mid, 0, 0, 0]
+                            )
                         a_v2 = vector.from_elements(vec2_i64, [a0, a1])
                         a_v8 = vector.bitcast(vec8_bf16, a_v2)
                         b_v2 = vector.from_elements(vec2_i64, [b0, b1])
@@ -8287,7 +8350,7 @@ def compile_mixed_moe_gemm2_a16w4(
                                     a0, a1 = a_tiles_cur[_flat]
 
                                     acc_idx = mi * num_acc_n + ni
-                                    acc_list[acc_idx] = _mfma_k32(
+                                    acc_list[acc_idx] = _mfma_k64(
                                         acc_list[acc_idx],
                                         a0,
                                         a1,
