@@ -421,14 +421,15 @@ def launch_gemm_a8w4_tdm(
             # Must pin all four: pinning only A/B leaves the SA/SB bases to be
             # reused and measures slower than baseline; all four nets ~2% on
             # gemm1 (relies on the VGPR headroom at floor occupancy, no spill).
-            lds_addr_keepalive(ba, bb, bsa, bsb)
+            # lds_addr_keepalive(ba, bb, bsa, bsb)
 
         def pf_step(cur_p, nxt):
             # nxt = (rmem_slot p, precomputed region bases, ksl) or None. The bases
             # are precomputed once per slot, so pf_load only emits ds_loads + immediates.
+            rocdl.sched_barrier(0)
             if const_expr(nxt is not None):
                 pf_load(nxt[0], nxt[1], nxt[2])
-            rocdl.sched_barrier(0)
+            # rocdl.sched_barrier(0)
             sc = pf_sc[cur_p].load()
             _sa_pf = [sc[wm] for wm in range_constexpr(wmma_m_rep)]
             _sb_pf = [sc[wmma_m_rep + wn] for wn in range_constexpr(wmma_n_rep)]
@@ -438,6 +439,17 @@ def launch_gemm_a8w4_tdm(
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(wmma_atom, c_frags[idx], pf_wt[cur_p][wn], pf_act[cur_p][wm],
                             c_frags[idx], scale_a=_sb_pf[wn], scale_b=_sa_pf[wm])
+
+            for ks in range_constexpr(32):
+                rocdl.sched_dsrd(2)
+                rocdl.sched_mfma(1)
+            # Pin the prefetch base registers live all the way past the gemm block
+            # (nxt[1] = (ba, bb, bsa, bsb)); extends their live ranges further than
+            # the pf_load-tail placement so the allocator can't reuse them anywhere
+            # in the compute either.
+            if const_expr(nxt is not None):
+                lds_addr_keepalive(*nxt[1])
+
             rocdl.sched_barrier(0)
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
