@@ -1,27 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+import math
 import os
+from typing import Optional
+
 import torch
 import triton
-import math
 from packaging.version import Version
+
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
     _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
-_TRITON_GE_37 = Version(triton.__version__) >= Version("3.7.0")
+_TRITON_VERSION = Version(triton.__version__)
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
@@ -307,7 +309,7 @@ def gemm_a8w8_blockscale_preshuffle(
     if (
         backend == "triton"
         and get_arch() == "gfx950"
-        and not _TRITON_GE_37
+        and _TRITON_VERSION < Version("3.7.0")
         and config.get("num_stages", 1) > 2
     ):
         config["num_stages"] = 2
