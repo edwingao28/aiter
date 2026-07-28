@@ -482,27 +482,26 @@ def compile_moe_gemm1(
                 sig = rocdl.rcp(T.f32, den)
                 return x * sig
 
+            _swiglu_limit = fx.Float32(_swiglu_eff_limit)
+            _swiglu_neg_limit = fx.Float32(-_swiglu_eff_limit)
+            _swiglu_one = fx.Float32(1.0)
+            _swiglu_alpha_neg_log2e = fx.Float32(
+                1.702 * (-1.4426950408889634)
+            )
+
             def swiglu_apply(gate_scaled, up_scaled):
                 """DSv3-style SwiGLU: g * sigmoid(1.702 * g) * (u + 1) with clamping.
                 Matches the aiter reference swiglu(alpha=1.702, limit=7) used by fp4_bf16 tests.
                 When swiglu_limit==0 (test default), effective limit is 7.0.
                 """
-                _limit_val = arith.constant(_swiglu_eff_limit, type=T.f32)
-                _neg_limit_val = arith.constant(-_swiglu_eff_limit, type=T.f32)
-                _one = arith.constant(1.0, type=T.f32)
-                _alpha_neg_log2e = arith.constant(
-                    1.702 * (-1.4426950408889634), type=T.f32
-                )
-                # Clamp gate (one-sided max) and up (two-sided)
-                g = arith.minimumf(gate_scaled, _limit_val)
-                u = arith.minimumf(up_scaled, _limit_val)
-                u = arith.maximumf(u, _neg_limit_val)
-                # sigmoid(1.702 * g) via fast exp2
-                t = g * _alpha_neg_log2e
+                g = arith.minimumf(gate_scaled, _swiglu_limit)
+                u = arith.minimumf(up_scaled, _swiglu_limit)
+                u = arith.maximumf(u, _swiglu_neg_limit)
+                t = g * _swiglu_alpha_neg_log2e
                 emu = rocdl.exp2(T.f32, t)
-                den = _one + emu
+                den = _swiglu_one + emu
                 sig = rocdl.rcp(T.f32, den)
-                return g * sig * (u + _one)
+                return g * sig * (u + _swiglu_one)
 
             acc_init = (
                 arith.constant_vector(0, T.i32x4)
