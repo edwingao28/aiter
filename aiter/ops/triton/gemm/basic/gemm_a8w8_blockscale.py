@@ -14,7 +14,11 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 )
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
