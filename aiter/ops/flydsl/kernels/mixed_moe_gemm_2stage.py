@@ -2113,8 +2113,6 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
                         result_elems.append(situ_elem(g) * situ_up_elem(u))
                     return vector.from_elements(vec4_f32, result_elems)
 
@@ -2147,8 +2145,6 @@ def compile_mixed_moe_gemm1(
                         )
                         return g * sig * (u + one)
                     elif const_expr(act == "situv2"):
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
                         return situ_elem(g) * situ_up_elem(u)
                     else:
                         g = _clamp_gate(g)
@@ -5436,16 +5432,11 @@ def compile_mixed_moe_gemm1_a16w4(
 
             def _situ_mul_vec4(gate_v4, up_v4):
                 result_elems = []
-                _limit = arith.constant(7.0, type=f32)
-                _neg_limit = arith.constant(-7.0, type=f32)
                 for ei in range_constexpr(4):
                     g = vector.extract(
                         gate_v4, static_position=[ei], dynamic_position=[]
                     )
                     u = vector.extract(up_v4, static_position=[ei], dynamic_position=[])
-                    g = arith.minimumf(g, _limit)
-                    u = arith.minimumf(u, _limit)
-                    u = arith.maximumf(u, _neg_limit)
                     result_elems.append(_situ_elem(g) * _situ_up_elem(u))
                 return vector.from_elements(vec4_f32, result_elems)
 
@@ -5473,11 +5464,6 @@ def compile_mixed_moe_gemm1_a16w4(
                     sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
                     return g_e * sig * (u_e + _one)
                 elif const_expr(act == "situv2"):
-                    _limit = arith.constant(7.0, type=f32)
-                    _neg_limit = arith.constant(-7.0, type=f32)
-                    g_e = arith.minimumf(g_e, _limit)
-                    u_e = arith.minimumf(u_e, _limit)
-                    u_e = arith.maximumf(u_e, _neg_limit)
                     return _situ_elem(g_e) * _situ_up_elem(u_e)
                 else:
                     return _silu_elem(g_e) * u_e

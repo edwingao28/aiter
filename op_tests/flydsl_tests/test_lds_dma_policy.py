@@ -250,5 +250,88 @@ class TestA16W4Bf16MfmaPolicy(unittest.TestCase):
         )
 
 
+class TestSituV2ActivationSemantics(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = MIXED_MOE_PATH.read_text()
+        cls.tree = ast.parse(cls.source)
+
+    def _nested_function(
+        self, enclosing_name: str, nested_name: str
+    ) -> ast.FunctionDef:
+        enclosing = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == enclosing_name
+        )
+        return next(
+            node
+            for node in ast.walk(enclosing)
+            if isinstance(node, ast.FunctionDef) and node.name == nested_name
+        )
+
+    def _assert_no_clamp_calls(self, function: ast.FunctionDef) -> None:
+        forbidden = {
+            "_clamp_gate",
+            "_clamp_lin",
+            "minimumf",
+            "maximumf",
+        }
+        calls = {
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Name, ast.Attribute))
+        }
+        self.assertTrue(
+            calls.isdisjoint(forbidden),
+            f"{function.name} must not clamp SiTUv2 inputs: {calls & forbidden}",
+        )
+
+    def test_vector_situv2_does_not_inherit_swiglu_clamps(self) -> None:
+        for enclosing_name, nested_name in (
+            ("compile_mixed_moe_gemm1", "situ_mul_vec4"),
+            ("compile_mixed_moe_gemm1_a16w4", "_situ_mul_vec4"),
+        ):
+            with self.subTest(enclosing_name=enclosing_name):
+                self._assert_no_clamp_calls(
+                    self._nested_function(enclosing_name, nested_name)
+                )
+
+    def test_scalar_situv2_branch_does_not_inherit_swiglu_clamps(self) -> None:
+        for enclosing_name, nested_name in (
+            ("compile_mixed_moe_gemm1", "act_elem"),
+            ("compile_mixed_moe_gemm1_a16w4", "_act_elem"),
+        ):
+            with self.subTest(enclosing_name=enclosing_name):
+                function = self._nested_function(enclosing_name, nested_name)
+                situv2_branch = next(
+                    node
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.If)
+                    and "act == 'situv2'" in ast.unparse(node.test)
+                )
+                branch_wrapper = ast.Module(
+                    body=situv2_branch.body,
+                    type_ignores=[],
+                )
+                self._assert_no_clamp_calls(
+                    ast.FunctionDef(
+                        name=f"{nested_name}_situv2_branch",
+                        args=ast.arguments(
+                            posonlyargs=[],
+                            args=[],
+                            kwonlyargs=[],
+                            kw_defaults=[],
+                            defaults=[],
+                        ),
+                        body=branch_wrapper.body,
+                        decorator_list=[],
+                    )
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
