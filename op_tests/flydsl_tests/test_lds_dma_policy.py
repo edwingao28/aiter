@@ -235,10 +235,17 @@ class TestA16W4Bf16MfmaPolicy(unittest.TestCase):
             and node.name == "_unpack_b_mxfp4_bf16_sw"
         )
 
-        self.assertIn("nibble_mask = arith.constant(0x0F0F0F0F", function_source)
-        self.assertIn("even = packed32 & nibble_mask", function_source)
+        self.assertIn("n0 = packed32 & c_0f", function_source)
         self.assertIn(
-            "odd = arith.shrui(packed32, c4) & nibble_mask",
+            "n1 = arith.shrui(packed32, c4) & c_0f",
+            function_source,
+        )
+        self.assertIn(
+            "first = n0 | arith.shli(n1, c8)",
+            function_source,
+        )
+        self.assertIn(
+            "second = n4 | arith.shli(n5, c8)",
             function_source,
         )
 

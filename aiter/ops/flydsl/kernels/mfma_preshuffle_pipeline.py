@@ -1180,17 +1180,33 @@ def _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32):
 
 def _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32):
     """Software fallback for non-GFX950 targets."""
-    nibble_mask = arith.constant(0x0F0F0F0F, type=T.i32)
+    c_0f = arith.constant(0x0F, type=T.i32)
     c4 = arith.constant(4, type=T.i32)
+    c8 = arith.constant(8, type=T.i32)
+    c12 = arith.constant(12, type=T.i32)
+    c16 = arith.constant(16, type=T.i32)
+    c20 = arith.constant(20, type=T.i32)
+    c24 = arith.constant(24, type=T.i32)
+    c28 = arith.constant(28, type=T.i32)
 
-    # shuffle_weight_a16w4 packs [v0..v3] in the low nibbles of four
-    # consecutive bytes and [v4..v7] in the corresponding high nibbles.
-    # The legacy K16 MFMA consumes those two contiguous-K groups separately.
-    even = packed32 & nibble_mask
-    odd = arith.shrui(packed32, c4) & nibble_mask
+    # Native MXFP4 stores consecutive K values in each byte:
+    # byte0=(v1<<4)|v0, byte1=(v3<<4)|v2, and so on.  A K16 MFMA operand
+    # needs four consecutive values, so the lower two bytes form b0 and the
+    # upper two bytes form b1.
+    n0 = packed32 & c_0f
+    n1 = arith.shrui(packed32, c4) & c_0f
+    n2 = arith.shrui(packed32, c8) & c_0f
+    n3 = arith.shrui(packed32, c12) & c_0f
+    first = n0 | arith.shli(n1, c8) | arith.shli(n2, c16) | arith.shli(n3, c24)
 
-    b0 = _fp4x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_f32=scale_f32)
-    b1 = _fp4x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_f32=scale_f32)
+    n4 = arith.shrui(packed32, c16) & c_0f
+    n5 = arith.shrui(packed32, c20) & c_0f
+    n6 = arith.shrui(packed32, c24) & c_0f
+    n7 = arith.shrui(packed32, c28) & c_0f
+    second = n4 | arith.shli(n5, c8) | arith.shli(n6, c16) | arith.shli(n7, c24)
+
+    b0 = _fp4x4_in_i32_to_bf16x4_i64(first, arith, vector, scale_f32=scale_f32)
+    b1 = _fp4x4_in_i32_to_bf16x4_i64(second, arith, vector, scale_f32=scale_f32)
     return (b0, b1)
 
 
