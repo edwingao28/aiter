@@ -15,6 +15,7 @@ MFMA_POLICY_PATH = REPO_ROOT / "aiter" / "ops" / "flydsl" / "kernels" / "mfma_po
 MIXED_MOE_PATH = (
     REPO_ROOT / "aiter" / "ops" / "flydsl" / "kernels" / "mixed_moe_gemm_2stage.py"
 )
+FUSED_MOE_PATH = REPO_ROOT / "aiter" / "fused_moe.py"
 PRESHUFFLE_PIPELINE_PATH = (
     REPO_ROOT / "aiter" / "ops" / "flydsl" / "kernels" / "mfma_preshuffle_pipeline.py"
 )
@@ -247,6 +248,76 @@ class TestA16W4Bf16MfmaPolicy(unittest.TestCase):
         self.assertIn(
             "second = n4 | arith.shli(n5, c8)",
             function_source,
+        )
+
+
+class TestA16W4FallbackTilePolicy(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        source = FUSED_MOE_PATH.read_text()
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_cap_flydsl_a16w4_tile_m_for_lds"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(FUSED_MOE_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        cls.cap_tile_m = staticmethod(namespace["_cap_flydsl_a16w4_tile_m_for_lds"])
+
+    def test_gfx942_a16w4_uses_the_proven_32_row_tile(self) -> None:
+        for arch in ("gfx940", "gfx941", "gfx942", "gfx942:sramecc+:xnack-"):
+            with self.subTest(arch=arch):
+                self.assertEqual(self.cap_tile_m(arch, "bf16", 128), 32)
+                self.assertEqual(self.cap_tile_m(arch, "fp16", 64), 32)
+
+    def test_newer_architectures_keep_the_requested_a16w4_tile(self) -> None:
+        for arch in ("gfx950", "gfx1250", "unknown"):
+            with self.subTest(arch=arch):
+                self.assertEqual(self.cap_tile_m(arch, "bf16", 128), 128)
+
+    def test_gfx942_non_a16w4_tiles_are_unchanged(self) -> None:
+        for activation_dtype in ("fp4", "fp8"):
+            with self.subTest(activation_dtype=activation_dtype):
+                self.assertEqual(
+                    self.cap_tile_m("gfx942", activation_dtype, 128),
+                    128,
+                )
+
+    def test_fallback_dispatch_applies_the_lds_cap_before_naming_kernels(
+        self,
+    ) -> None:
+        source = FUSED_MOE_PATH.read_text()
+        tree = ast.parse(source)
+        get_2stage_cfgs = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "get_2stage_cfgs"
+        )
+        assignments = [
+            node
+            for node in ast.walk(get_2stage_cfgs)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_tile_m"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_cap_flydsl_a16w4_tile_m_for_lds"
+        ]
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(
+            [ast.unparse(arg) for arg in assignments[0].value.args],
+            ["gfx", "_a_type", "_tile_m"],
         )
 
 

@@ -54,6 +54,28 @@ from aiter.ops.flydsl.mxfp4_kname import (
 
 BLOCK_SIZE_M = 32
 
+
+def _cap_flydsl_a16w4_tile_m_for_lds(
+    gfx: str,
+    activation_dtype: str,
+    requested_tile_m: int,
+) -> int:
+    """Keep gfx94 A16W4 ping-pong LDS within the 64 KiB workgroup limit.
+
+    A 128x256 BF16 input tile needs 64 KiB for each ping-pong buffer, so the
+    stage-1 kernel requests 128 KiB of LDS on gfx94. The 32-row tile is already
+    exercised by the Kimi-K3 gfx942 correctness probe and leaves room below the
+    architectural limit. FP8/FP4 activation paths retain their existing tiles.
+    """
+    normalized_gfx = str(gfx).split(":", 1)[0]
+    if normalized_gfx in {"gfx940", "gfx941", "gfx942"} and activation_dtype in {
+        "bf16",
+        "fp16",
+    }:
+        return min(int(requested_tile_m), 32)
+    return int(requested_tile_m)
+
+
 # Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
 # Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
@@ -2249,6 +2271,11 @@ def get_2stage_cfgs(
             _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
         else:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        _tile_m = _cap_flydsl_a16w4_tile_m_for_lds(
+            gfx,
+            _a_type,
+            _tile_m,
+        )
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
